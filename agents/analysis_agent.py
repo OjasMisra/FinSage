@@ -24,6 +24,7 @@ import os
 import logging
 import re
 import threading
+import contextvars
 from typing import Optional
 from snowflake.snowpark import Session
 
@@ -149,14 +150,68 @@ GUARDRAIL_FALLBACK = (
 )
 
 
+class GuardrailAudit:
+    """
+    Per-report record of every guardrail check: passed, blocked, or skipped.
+
+    Guardrails fail open by design (a report should not die at minute 12
+    because Bedrock timed out), so a skipped check must be visible in the
+    report itself, not just in the logs. The report appendix renders this.
+    Thread-safe: Stage 3b/3c record into the same audit from worker threads.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.passed: list = []
+        self.blocked: list = []
+        self.skipped: list = []
+
+    def record(self, outcome: str, label: str) -> None:
+        with self._lock:
+            getattr(self, outcome).append(label)
+
+    def summary(self) -> dict:
+        with self._lock:
+            return {
+                "passed": len(self.passed),
+                "blocked": len(self.blocked),
+                "skipped": len(self.skipped),
+                "blocked_sections": sorted(set(self.blocked)),
+                "skipped_sections": sorted(set(self.skipped)),
+            }
+
+
+# One audit per report run. A ContextVar (not a module global) because the
+# API can generate several reports concurrently in the same process.
+_guardrail_audit: contextvars.ContextVar = contextvars.ContextVar(
+    "guardrail_audit", default=None
+)
+
+
+def start_guardrail_audit() -> GuardrailAudit:
+    """Begin a fresh audit for the current report run and return it."""
+    audit = GuardrailAudit()
+    _guardrail_audit.set(audit)
+    return audit
+
+
+def _record_guardrail(outcome: str, label: str) -> None:
+    audit = _guardrail_audit.get()
+    if audit is not None:
+        audit.record(outcome, label)
+
+
 def _validate_with_guardrails(text: str, label: str = "output") -> str:
     """
     Validate text through Bedrock Guardrails if available.
     Returns the original text if guardrails are unavailable or text passes.
     Returns GUARDRAIL_FALLBACK if text is blocked.
+    Every outcome is recorded in the current GuardrailAudit (if one is active),
+    including skips, so the report can disclose unvalidated sections.
     """
     guard = _get_guardrail()
     if guard is None:
+        _record_guardrail("skipped", label)
         return text
     try:
         result = guard.check_output(text)
@@ -164,10 +219,22 @@ def _validate_with_guardrails(text: str, label: str = "output") -> str:
             logger.warning(
                 "Guardrail BLOCKED %s: %s", label, result.get("details", [])
             )
+            _record_guardrail("blocked", label)
             return GUARDRAIL_FALLBACK
+        # check_output() swallows service errors and returns action="ERROR"
+        # with blocked=False, so an error here means the text was never checked.
+        if result.get("action") == "ERROR":
+            logger.warning(
+                "Guardrail check errored for %s: %s — using original text",
+                label, result.get("details", []),
+            )
+            _record_guardrail("skipped", label)
+            return text
+        _record_guardrail("passed", label)
         return text
     except Exception as e:
         logger.warning("Guardrail check failed for %s: %s — using original text", label, e)
+        _record_guardrail("skipped", label)
         return text
 
 

@@ -22,6 +22,7 @@ import json
 import logging
 import argparse
 import concurrent.futures
+import contextvars
 from datetime import datetime
 from pathlib import Path
 
@@ -39,7 +40,7 @@ from snowflake_connection import get_session
 from chart_agent import generate_charts, regenerate_single_chart
 from chart_specs import CANONICAL_CHART_ORDER
 from validation_agent import validate_all_charts, validate_chart
-from analysis_agent import run_analysis, generate_company_overview, generate_peer_comparison, generate_financial_deep_dive, generate_valuation_analysis
+from analysis_agent import run_analysis, generate_company_overview, generate_peer_comparison, generate_financial_deep_dive, generate_valuation_analysis, start_guardrail_audit
 from report_agent import generate_report
 from src.utils.observability import RunContext, PipelineTracker
 
@@ -158,6 +159,7 @@ def stage_analysis(session, charts: list, ticker: str,
     logger.info("━" * 50)
     logger.info("STAGE 3a: LLM Analysis (Chain-of-Analysis — serial)")
     logger.info("━" * 50)
+    guardrail_audit = start_guardrail_audit()
     analysis = run_analysis(session, charts, ticker, detail_level=detail_level)
     logger.info("Stage 3a complete: %d chart analyses + SEC summaries",
                 len(analysis.get("chart_analyses", [])))
@@ -220,8 +222,10 @@ def stage_analysis(session, charts: list, ticker: str,
         ]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        # copy_context() carries the guardrail audit into each worker thread
         futures = {
-            executor.submit(_run_task, name, fn, ticker, **kwargs): name
+            executor.submit(contextvars.copy_context().run,
+                            _run_task, name, fn, ticker, **kwargs): name
             for name, fn, kwargs in tasks
         }
 
@@ -234,6 +238,11 @@ def stage_analysis(session, charts: list, ticker: str,
                 logger.exception("Unexpected failure in %s", name)
                 analysis[name] = _defaults[name]
 
+    analysis["guardrail_audit"] = guardrail_audit.summary()
+    if analysis["guardrail_audit"]["skipped"]:
+        logger.warning("Guardrails skipped for %d section(s): %s",
+                       analysis["guardrail_audit"]["skipped"],
+                       ", ".join(analysis["guardrail_audit"]["skipped_sections"]))
     return analysis
 
 

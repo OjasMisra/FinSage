@@ -31,6 +31,7 @@ import sys
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY, TA_RIGHT
@@ -1825,7 +1826,73 @@ def build_recommendation_page(ticker: str, charts: list, analysis: dict,
     return elements
 
 
-def build_appendix(ticker: str, charts: list, styles: dict) -> list:
+_SECTION_NAMES = {"mda_summary": "MD&A Summary"}
+
+
+def _section_name(label: str) -> str:
+    return _SECTION_NAMES.get(label, label.replace("_", " ").title())
+
+
+def build_guardrail_disclosure(guardrail_audit: Optional[dict], styles: dict,
+                               content_width: float) -> list:
+    """
+    Appendix block stating what the content-safety guardrails actually did.
+
+    Guardrails fail open (the text is kept if the check cannot run), so the
+    reader needs to see which sections went out unvalidated.
+    """
+    elements = [Paragraph("Guardrail Checks", styles["appendix_header"])]
+
+    if guardrail_audit is None:
+        elements.append(Paragraph(
+            "Guardrail status was not recorded for this report.",
+            styles["appendix_body"],
+        ))
+        elements.append(Spacer(1, 8 * mm))
+        return elements
+
+    skipped = guardrail_audit.get("skipped_sections", [])
+    blocked = guardrail_audit.get("blocked_sections", [])
+    rows = [
+        ["Outcome", "Checks", "Sections"],
+        ["Passed", str(guardrail_audit.get("passed", 0)), "—"],
+        ["Blocked (replaced with notice)", str(guardrail_audit.get("blocked", 0)),
+         ", ".join(_section_name(s) for s in blocked) or "—"],
+        ["Skipped (not validated)", str(guardrail_audit.get("skipped", 0)),
+         ", ".join(_section_name(s) for s in skipped) or "—"],
+    ]
+    table = Table(
+        rows,
+        colWidths=[content_width * 0.32, content_width * 0.12, content_width * 0.56]
+    )
+    table.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, 0),  C_DARK),
+        ("TEXTCOLOR",     (0, 0), (-1, 0),  C_WHITE),
+        ("FONTNAME",      (0, 0), (-1, 0),  "Helvetica-Bold"),
+        ("FONTSIZE",      (0, 0), (-1, -1), 9),
+        ("ROWBACKGROUNDS",(0, 1), (-1, -1), [C_LIGHT_GRAY, C_WHITE]),
+        ("GRID",          (0, 0), (-1, -1), 0.5, C_DIVIDER),
+        ("TOPPADDING",    (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+        ("ALIGN",         (1, 0), (1, -1), "CENTER"),
+    ]))
+    elements.append(table)
+
+    if skipped:
+        elements.append(Spacer(1, 3 * mm))
+        elements.append(Paragraph(
+            "Sections marked skipped were included without content-safety "
+            "validation because the guardrail service was unavailable or "
+            "returned an error. Review them before relying on this report.",
+            styles["appendix_body"],
+        ))
+    elements.append(Spacer(1, 8 * mm))
+    return elements
+
+
+def build_appendix(ticker: str, charts: list, styles: dict,
+                   guardrail_audit: Optional[dict] = None) -> list:
     """Build appendix + disclaimer page."""
     elements = []
     elements.append(PageBreak())
@@ -1897,6 +1964,8 @@ def build_appendix(ticker: str, charts: list, styles: dict) -> list:
     ]))
     elements.append(meta_table)
     elements.append(Spacer(1, 8 * mm))
+
+    elements += build_guardrail_disclosure(guardrail_audit, styles, content_width)
 
     # CAVM Pipeline Architecture
     elements.append(Paragraph("CAVM Pipeline Architecture", styles["appendix_header"]))
@@ -2142,7 +2211,8 @@ def build_pdf(
         # Appendix (skip in summary mode)
         if detail_level != "summary":
             elems.append(SectionMarker("appendix", pm))
-            elems += build_appendix(ticker, charts, styles)
+            elems += build_appendix(ticker, charts, styles,
+                                    guardrail_audit=analysis.get("guardrail_audit"))
 
         return elems
 
